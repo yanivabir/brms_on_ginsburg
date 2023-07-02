@@ -16,6 +16,7 @@ send_file <- function(session, file, fld){
 
 # Create and save r script to run model
 save_r_script <- function(r_library,
+    cmdstan_path,
     data_file,
     formula,
     prior,
@@ -36,7 +37,9 @@ save_r_script <- function(r_library,
     # Create r script to run model
     script <- c(
         str_glue(".libPaths('{r_library}')"),
+        "print(tempdir())",
         "library(brms)",
+        str_glue("Sys.setenv(CMDSTAN='{cmdstan_path}')"),
         "library(cmdstanr)",
         str_glue("load('./{data_file}')"),
         str_glue("(m <- brm({formula},
@@ -63,7 +66,7 @@ save_r_script <- function(r_library,
     # Add criteria if needed
     if (!is.null(criteria)){
         script <- c(script,
-            str_glue("add_criterion(m, '{criteria}', cores = {cores})"))
+            str_glue("add_criterion(m, '{criteria}', cores = {cores}, moment_match = T)"))
     }
 
     # Save .R file locally
@@ -85,7 +88,8 @@ save_sh_script <- function(lab,
     cores,
     wall_time,
     memory,
-    r_file_name) {
+    r_file_name,
+    tmpdir) {
     script <- c(
         "#!/bin/sh",
         str_glue("#SBATCH --account={lab}"),
@@ -106,6 +110,7 @@ save_sh_script <- function(lab,
 
     script <- c(
         script, 
+        str_glue("export TMPDIR={tmpdir}"),
         "module load R",
         str_glue("Rscript {r_file_name}")
     )
@@ -134,7 +139,8 @@ launch_model <- function(
     project = "test",
     lab = "dslab",
     user = "ya2402",
-    r_library = "~",
+    r_library = "/burg/dslab/users/ya2402/R_lib",
+    cmdstan_path = "/burg/dslab/users/ya2402/R_lib/.cmdstan/cmdstan-2.32.2",
     saved_models_fld = "./saved_models/",
     criteria = NULL,
     confirm = TRUE,
@@ -146,10 +152,15 @@ launch_model <- function(
     # Replace all double with single quotes
     formula <- gsub('"', "'", formula)
     prior <- gsub('"', "'", prior)
+    
+    # Keep only needed columns in data to reduce traffic
+    data_cols <- all.vars(eval(parse(text = formula))$formula)
+    data <- data[, data_cols, with = F]
 
     # Paths
     ufld <- paste0("/burg/", lab, "/users/", user) # User folder on Ginsburg
     fld <- paste0(ufld, "/autorun_models/", project) # Project folder to work in on Gisnburg
+    tmpdir <- file.path(ufld, "tmp") # Local tmp folder to avoid small size
     data_file <- paste0(model_name, "_data.rda")
     local_model_file <- file.path(saved_models_fld, paste0(model_name, ".rds"))
 
@@ -176,17 +187,17 @@ launch_model <- function(
     # Create a projects folder if needed
     ssh_exec_wait(session, paste("mkdir -p", fld))
     
+    # Create a tmp folder if needed
+    ssh_exec_wait(session, paste("mkdir -p", tmpdir))
+    
     # Remove saved file on Ginsburg if refit is True
     if (refit){
       ssh_exec_wait(session, paste("rm -f", file.path(fld, paste0(model_name, ".rds"))))
     }
 
-    # Send data to server
-    save(data, file = data_file)
-    send_file(session, data_file, fld)
-
     # Send rscript to server
     r_script <- save_r_script(r_library,
+        cmdstan_path,
         data_file,
         formula,
         prior,
@@ -209,9 +220,14 @@ launch_model <- function(
         cores,
         wall_time,
         memory,
-        r_script
+        r_script,
+        tmpdir
     )
     send_file(session, sh_script, fld)
+    
+    # Send data to server
+    save(data, file = data_file)
+    send_file(session, data_file, fld)
 
     # Launch task on server
     out <- ssh_exec_internal(session, command = c(
